@@ -1,0 +1,7 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "AllS3", "Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+    {"Sid": "NoDelete", "Effect": "Deny", "Action": "s3:DeleteBucket", "Resource": "*"}
+  ]
+}

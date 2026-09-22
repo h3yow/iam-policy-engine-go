@@ -1,0 +1,5 @@
+{
+  "Statement": [
+    {"Sid": "ReadOnly", "Effect": "Allow", "Action": ["s3:Get*"], "Resource": "*"}
+  ]
+}
