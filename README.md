@@ -15,10 +15,12 @@ pkg/policies/        策略领域模型
   types.go           Effect / Statement / Policy / Credentials / 条件值类型
   parse.go           JSON 策略文档解析与规范化（含 NotAction/NotResource、条件树）
   match.go           动作/资源的通配匹配（* 与 ?）
-  condition.go       条件运算符语义与可区分失败原因
+  condition.go       条件运算符语义、多值量词与可区分失败原因
+  ip.go              IP/CIDR（IPv4 与 IPv6）包含关系判定
   statement.go       单条语句对请求的匹配（含排除形式）
 pkg/engine/
   engine.go          判定流水线：凭证 -> 显式拒绝 -> 身份允许 -> 边界 -> 会话
+  batch.go           批量判定：保序、并发、与单条判定结果一致
 cmd/iamctl/          本地命令行验证入口
 examples/            示例策略与请求
 ```
@@ -91,7 +93,6 @@ examples/            示例策略与请求
 
 条件结构为 `{ "运算符": { "键": [期望值...] } }`：
 
-- 当键对应列表，或期望值为列表时，遵循 **任一元素满足即成立**；
 - 支持运算符：
   - 字符串：`StringEquals`、`StringNotEquals`、`StringEqualsIgnoreCase`、
     `StringLike`（右侧为通配模式）、`StringNotLike`
@@ -99,8 +100,53 @@ examples/            示例策略与请求
     `GreaterThan` / `GreaterThanEquals`
   - 布尔：`Bool`
   - 时间：`DateEquals`、`DateBefore`、`DateAfter`（RFC3339 / `2006-01-02`）
+  - 网络位置：`IpAddress` / `NotIpAddress`（见下文「IP 与 ARN 条件」）
+  - 资源标识：`ArnLike` / `ArnNotLike`（按通配模式匹配 ARN）
   - 任意运算符可加 `IfExists` 后缀（如 `StringEqualsIfExists`）：键缺失时
     该条件视为成立而非失败。
+
+#### 多值上下文与量词
+
+上下文键可以携带一组值（`policies.ListV(...)`，或请求 JSON 中写数组）。运算符
+名可显式加量词前缀声明归约方式：
+
+- `ForAnyValue:`（如 `ForAnyValue:StringEquals`）：**至少一个**实际值与某个
+  期望值比较成立，条件即成立；
+- `ForAllValues:`（如 `ForAllValues:StringEquals`）：**每一个**实际值都要与
+  某个期望值比较成立（不同值可命中期望值列表的不同成员）；
+- **不写前缀时默认 `ForAnyValue`**。该默认行为与值的个数、顺序无关；单值键的
+  结论与历史版本完全一致（既有策略无需修改）。
+
+量词可与 `IfExists` 后缀组合（如 `ForAllValues:StringEqualsIfExists`）。
+
+**取反运算符的整组集合语义**：`StringNotEquals`、`StringNotLike`、
+`NumericNotEquals`、`NotIpAddress`、`ArnNotLike` 这类带取反意味的运算符，比较
+的是**整组实际取值与排除集合**的关系——无论是否显式声明量词，只要实际取值中
+有**任何一个**落在排除集合内，该条件就不成立；其它取值不在集合内也不能放行。
+全部实际值都在排除集合之外时条件才成立。单值场景下结论与历史版本一致。
+
+**边界情形的稳定结论**（均可通过 `ConditionReason` 区分）：
+
+| 情形 | 结论 |
+|---|---|
+| 键缺失（无 `IfExists`） | 失败，`condition_key_missing`（取反运算符同样失败，fail-closed） |
+| 键存在但值为空列表 + 正向运算符 | 失败，`condition_empty_value_set` |
+| 键存在但值为空列表 + 取反运算符 | 成立（没有任何值落入排除集合，vacuously true） |
+| 实际值/期望值对运算符域非法（如写错的 IP/网段） | 失败，`condition_invalid_value` |
+
+#### IP 与 ARN 条件
+
+- `IpAddress` / `NotIpAddress`：实际值为字面 IP（IPv4 或 IPv6），期望值可以是
+  单个地址或 CIDR 网段（如 `10.0.0.0/8`、`2001:db8::/32`）；裸地址按主机前缀
+  （`/32` / `/128`）处理。网段包含关系按前缀位严格计算，**网络地址与广播地址
+  等边界地址属于网段内**，紧邻网段外的地址不会误判。带 zone 的 IPv6 地址
+  （`fe80::1%eth0`）视为非法。写错的地址或网段（如 `10.0.0.0/33`、
+  `999.1.2.3`）一律以 `condition_invalid_value` 失败，**不会**被悄悄当成
+  不匹配或放行。
+- `ArnLike` / `ArnNotLike`：按通配模式（`*` / `?`，与动作/资源匹配同一套
+  语义）比较 ARN 字符串。
+- 两类运算符都遵循上面的多值量词规则；取反形式遵循整组集合语义。
+
 - **确定的失败规则（全部 fail-closed，导致语句不匹配、绝不允许）**，并以
   可区分的原因记录在 `Result.Conditions` 中：
 
@@ -110,6 +156,8 @@ examples/            示例策略与请求
 | 实际值或期望值类型与运算符不符 | `condition_type_mismatch` |
 | 运算符名称未知 | `condition_unknown_operator` |
 | 键存在、类型正确但比较不成立 | `condition_did_not_match` |
+| 键对应空值列表（正向运算符） | `condition_empty_value_set` |
+| 值对运算符域非法（如非法 IP/CIDR） | `condition_invalid_value` |
 
 - 解析期类型推断：JSON `true/false` → Bool，数字 → Number，可解析的时间字符串
   → Time，其余字符串 → String。因此数字比较请在 JSON 中写数字 `10` 而非 `"10"`。
@@ -131,6 +179,32 @@ examples/            示例策略与请求
   顺序产生字节级一致的 `Result`（见 `TestOrderAndDuplicateDeterminism`）；
 - 条件子句按运算符名、键名排序遍历，不受 Go map 迭代序影响。
 
+## 批量与并发判定
+
+`Engine.EvaluateBatch(reqs []Request) []Result` 面向巡检等批量场景：
+
+- **保序**：`results[i]` 对应 `reqs[i]`，与提交顺序一致；
+- **与单条判定一致**：每条结果与单独调用 `Evaluate` 完全相同（测试中用
+  `reflect.DeepEqual` 逐条比对）；
+- **并发安全**：`Engine` 构造后不可变，判定过程不持有任何共享可变状态（每条
+  请求的命中/条件累积器相互独立），可安全地在多个 goroutine 间共享同一个
+  引擎并混用 `Evaluate` / `EvaluateBatch`；批量内部以不超过 `GOMAXPROCS` 的
+  有界 worker 池并行执行，规模增大时吞吐随核数扩展，且前一条请求的上下文
+  绝不会影响后一条的结论；
+- 空批次返回 `nil`。
+
+## 兼容范围
+
+本次扩展对既有行为的承诺：
+
+- 单值上下文键在既有运算符下的结论**完全不变**（默认量词即历史行为）；
+- 取反运算符在「单实际值 + 单期望值」下结论不变；「单实际值 + 多期望值」时
+  旧行为是「与任一期望值不等即成立」，现按整组集合语义修正为「不等于所有
+  期望值才成立」（即实际值落在排除集合内即不成立）——这是对旧行为中
+  与排除语义相悖情形的修正，请检查依赖旧行为的策略；
+- 新增运算符（`IpAddress` 等）此前会被判为 `condition_unknown_operator` 并
+  fail-closed 拒绝，现在按真实语义判定；策略文档无需任何修改即可继续使用。
+
 ## 验证方法
 
 运行全部单元测试（含竞态检测）：
@@ -141,8 +215,12 @@ go test ./... -race -count=1 -v
 
 测试覆盖：显式拒绝覆盖 `Allow *`、默认拒绝、通配与 `Not*` 排除边界、条件缺失/
 类型不匹配/未知运算符、权限边界收紧、会话策略收紧、凭证缺失/过期/未生效、
-顺序与重复的幂等性。每个用例都会在测试日志中打印**请求上下文、命中规则、
-条件判定与最终结论**（使用 `-v` 查看）。
+顺序与重复的幂等性，以及本次新增的：**多值量词**（`ForAllValues:` /
+`ForAnyValue:` / 默认行为、取反整组集合语义、空集合与缺键边界）、**IP/ARN
+条件**（IPv4/IPv6 网段边界、非法地址与网段、取反形式）、**批量与并发判定**
+（保序、与单条判定逐条一致、`-race` 下并发混用不漂移、请求间上下文不串扰）。
+每个用例都会在测试日志中打印**请求上下文、命中规则、条件判定与最终结论**
+（使用 `-v` 查看）。
 
 命令行端到端验证（Allow 退出码 0，Deny 退出码 1）：
 

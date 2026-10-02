@@ -1,6 +1,10 @@
 package policies
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Effect is the conclusion produced by an individual policy statement.
 type Effect string
@@ -52,6 +56,28 @@ func BoolV(b bool) Value      { return Value{Kind: KindBool, Bool: b} }
 func TimeV(t time.Time) Value { return Value{Kind: KindTime, When: t} }
 func ListV(vs ...Value) Value { return Value{Kind: KindList, List: vs} }
 func MissingV() Value         { return Value{Kind: KindMissing, Missing: true} }
+
+// String renders the value in a compact, log-friendly form.
+func (v Value) String() string {
+	switch v.Kind {
+	case KindString:
+		return fmt.Sprintf("%q", v.Str)
+	case KindNumber:
+		return fmt.Sprintf("%v", v.Num)
+	case KindBool:
+		return fmt.Sprintf("%v", v.Bool)
+	case KindTime:
+		return v.When.UTC().Format(time.RFC3339)
+	case KindList:
+		parts := make([]string, len(v.List))
+		for i, e := range v.List {
+			parts[i] = e.String()
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	default:
+		return "<missing>"
+	}
+}
 
 // Statement is a single normalized policy rule.
 //

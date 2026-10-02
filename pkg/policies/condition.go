@@ -27,11 +27,39 @@ const (
 	CondTypeMismatch    ConditionReason = "condition_type_mismatch"
 	CondUnknownOperator ConditionReason = "condition_unknown_operator"
 	CondNoMatch         ConditionReason = "condition_did_not_match"
+	// CondEmptyValueSet: the context key held an empty list. Positive
+	// operators cannot be satisfied by zero values; negated operators
+	// succeed vacuously (nothing falls into the exclusion set).
+	CondEmptyValueSet ConditionReason = "condition_empty_value_set"
+	// CondInvalidValue: an actual or expected value was malformed for the
+	// operator's domain (e.g. an unparseable IP/CIDR). Fail-closed and
+	// distinguishable from an ordinary no-match.
+	CondInvalidValue ConditionReason = "condition_invalid_value"
 )
 
 // ifExistsSuffix mirrors the AWS-style "...IfExists" qualifier: when present,
 // a missing context key makes the clause succeed instead of failing.
 const ifExistsSuffix = "IfExists"
+
+// Quantifier selects how a multi-valued context key is reduced to a single
+// boolean for positive (non-negated) operators.
+type Quantifier int
+
+const (
+	// QuantAny is the default: at least one actual value must satisfy the
+	// comparison. For single-valued keys this is exactly the historical
+	// behavior, so existing policies are unaffected.
+	QuantAny Quantifier = iota
+	// QuantAll requires EVERY actual value to satisfy the comparison
+	// against at least one expected value.
+	QuantAll
+)
+
+// quantifier prefixes recognized in front of the operator name.
+const (
+	forAllValuesPrefix = "ForAllValues:"
+	forAnyValuePrefix  = "ForAnyValue:"
+)
 
 // EvaluateConditions evaluates every clause of a statement against ctx.
 //
@@ -93,19 +121,44 @@ func flatten(v Value) []Value {
 }
 
 // evalClause evaluates one (operator, key, expected-values) triple.
+//
+// Multi-value semantics:
+//   - The operator name may carry a "ForAllValues:" / "ForAnyValue:" prefix
+//     (combinable with the "IfExists" suffix). Without a prefix the default
+//     is ForAnyValue, which for single-valued keys reproduces the historical
+//     behavior exactly; the result never depends on how many values the
+//     context key holds or on their order.
+//   - Negated operators (StringNotEquals, StringNotLike, NumericNotEquals,
+//     NotIpAddress, ArnNotLike, ...) ALWAYS use whole-set exclusion
+//     semantics regardless of the quantifier: the clause succeeds only when
+//     NO actual value matches ANY expected value. One actual value falling
+//     inside the exclusion set fails the clause, even if other actual
+//     values are outside it.
+//   - An empty actual value set fails positive operators with
+//     CondEmptyValueSet and satisfies negated operators vacuously; both
+//     outcomes are stable and distinguishable from a missing key
+//     (CondKeyMissing) and from an ordinary mismatch (CondNoMatch).
 func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason) {
 	name := string(op)
-	allowMissing := false
 	if strings.HasSuffix(name, ifExistsSuffix) {
 		name = strings.TrimSuffix(name, ifExistsSuffix)
-		allowMissing = true
+		// Missing-key tolerance was already handled by the caller.
 	}
-	_ = allowMissing // presence was already handled by the caller
+
+	quant := QuantAny
+	if strings.HasPrefix(name, forAllValuesPrefix) {
+		quant = QuantAll
+		name = strings.TrimPrefix(name, forAllValuesPrefix)
+	} else if strings.HasPrefix(name, forAnyValuePrefix) {
+		quant = QuantAny
+		name = strings.TrimPrefix(name, forAnyValuePrefix)
+	}
 
 	pred, kind, known := operatorSpec(Operator(name))
 	if !known {
 		return false, CondUnknownOperator
 	}
+	negated := isNegatedOperator(Operator(name))
 
 	gotElems := flatten(got)
 	var expElems []Value
@@ -116,8 +169,20 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 		return false, CondNoMatch
 	}
 
+	// Empty actual set: stable, distinguishable boundary outcome.
+	if len(gotElems) == 0 {
+		if negated {
+			return true, CondOK // nothing can fall into the exclusion set
+		}
+		return false, CondEmptyValueSet
+	}
+
+	// matches[i] reports whether actual value i satisfies the predicate
+	// against at least one expected value of the right kind.
+	matches := make([]bool, len(gotElems))
 	typeError := false
-	for _, g := range gotElems {
+	invalid := false
+	for i, g := range gotElems {
 		if g.Kind != kind {
 			typeError = true
 			continue
@@ -127,7 +192,51 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 				typeError = true
 				continue
 			}
-			if pred(g, x) {
+			ok, valid := pred(g, x)
+			if !valid {
+				invalid = true
+				continue
+			}
+			if ok {
+				matches[i] = true
+				break
+			}
+		}
+	}
+
+	// Malformed values (e.g. bad CIDR) are reported before anything else:
+	// they must never be silently treated as a match or a non-match.
+	if invalid {
+		return false, CondInvalidValue
+	}
+
+	if negated {
+		for _, m := range matches {
+			if m {
+				return false, CondNoMatch // one value fell into the exclusion set
+			}
+		}
+		if typeError {
+			return false, CondTypeMismatch
+		}
+		return true, CondOK
+	}
+
+	switch quant {
+	case QuantAll:
+		all := true
+		for _, m := range matches {
+			if !m {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true, CondOK
+		}
+	default: // QuantAny
+		for _, m := range matches {
+			if m {
 				return true, CondOK
 			}
 		}
@@ -138,8 +247,27 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 	return false, CondNoMatch
 }
 
-// predicate compares one actual value against one expected value.
-type predicate func(got, expected Value) bool
+// isNegatedOperator reports whether the operator carries exclusion ("not")
+// semantics and therefore always compares the whole actual value set against
+// the exclusion set.
+func isNegatedOperator(op Operator) bool {
+	switch op {
+	case "StringNotEquals", "StringNeq", "StringNotLike",
+		"NumericNotEquals", "NotIpAddress", "ArnNotLike":
+		return true
+	}
+	return false
+}
+
+// predicate compares one actual value against one expected value. It reports
+// whether the comparison matched and whether both operands were well-formed
+// for the operator's domain (valid == false surfaces as CondInvalidValue).
+type predicate func(got, expected Value) (matched, valid bool)
+
+// alwaysValid adapts a simple boolean comparison into a predicate.
+func alwaysValid(f func(g, e Value) bool) predicate {
+	return func(g, e Value) (bool, bool) { return f(g, e), true }
+}
 
 // operatorSpec maps an operator to its comparison predicate and the value kind
 // it operates on.
@@ -147,41 +275,49 @@ func operatorSpec(op Operator) (predicate, ValueKind, bool) {
 	switch op {
 	// ---- strings ----
 	case "StringEquals", "StringEq":
-		return func(g, e Value) bool { return g.Str == e.Str }, KindString, true
+		return alwaysValid(func(g, e Value) bool { return g.Str == e.Str }), KindString, true
 	case "StringNotEquals", "StringNeq":
-		return func(g, e Value) bool { return g.Str != e.Str }, KindString, true
+		return alwaysValid(func(g, e Value) bool { return g.Str == e.Str }), KindString, true
 	case "StringEqualsIgnoreCase":
-		return func(g, e Value) bool { return strings.EqualFold(g.Str, e.Str) }, KindString, true
+		return alwaysValid(func(g, e Value) bool { return strings.EqualFold(g.Str, e.Str) }), KindString, true
 	case "StringLike":
-		return func(g, e Value) bool { return MatchPattern(e.Str, g.Str) }, KindString, true
+		return alwaysValid(func(g, e Value) bool { return MatchPattern(e.Str, g.Str) }), KindString, true
 	case "StringNotLike":
-		return func(g, e Value) bool { return !MatchPattern(e.Str, g.Str) }, KindString, true
+		return alwaysValid(func(g, e Value) bool { return MatchPattern(e.Str, g.Str) }), KindString, true
 
 	// ---- numbers ----
 	case "NumericEquals":
-		return func(g, e Value) bool { return g.Num == e.Num }, KindNumber, true
+		return alwaysValid(func(g, e Value) bool { return g.Num == e.Num }), KindNumber, true
 	case "NumericNotEquals":
-		return func(g, e Value) bool { return g.Num != e.Num }, KindNumber, true
+		return alwaysValid(func(g, e Value) bool { return g.Num == e.Num }), KindNumber, true
 	case "NumericLessThan":
-		return func(g, e Value) bool { return g.Num < e.Num }, KindNumber, true
+		return alwaysValid(func(g, e Value) bool { return g.Num < e.Num }), KindNumber, true
 	case "NumericLessThanEquals":
-		return func(g, e Value) bool { return g.Num <= e.Num }, KindNumber, true
+		return alwaysValid(func(g, e Value) bool { return g.Num <= e.Num }), KindNumber, true
 	case "NumericGreaterThan":
-		return func(g, e Value) bool { return g.Num > e.Num }, KindNumber, true
+		return alwaysValid(func(g, e Value) bool { return g.Num > e.Num }), KindNumber, true
 	case "NumericGreaterThanEquals":
-		return func(g, e Value) bool { return g.Num >= e.Num }, KindNumber, true
+		return alwaysValid(func(g, e Value) bool { return g.Num >= e.Num }), KindNumber, true
 
 	// ---- booleans ----
 	case "Bool":
-		return func(g, e Value) bool { return g.Bool == e.Bool }, KindBool, true
+		return alwaysValid(func(g, e Value) bool { return g.Bool == e.Bool }), KindBool, true
 
 	// ---- dates ----
 	case "DateEquals":
-		return func(g, e Value) bool { return g.When.Equal(e.When) }, KindTime, true
+		return alwaysValid(func(g, e Value) bool { return g.When.Equal(e.When) }), KindTime, true
 	case "DateBefore":
-		return func(g, e Value) bool { return g.When.Before(e.When) }, KindTime, true
+		return alwaysValid(func(g, e Value) bool { return g.When.Before(e.When) }), KindTime, true
 	case "DateAfter":
-		return func(g, e Value) bool { return g.When.After(e.When) }, KindTime, true
+		return alwaysValid(func(g, e Value) bool { return g.When.After(e.When) }), KindTime, true
+
+	// ---- network location ----
+	case "IpAddress", "NotIpAddress":
+		return ipInExpected, KindString, true
+
+	// ---- resource identifiers ----
+	case "ArnLike", "ArnNotLike":
+		return alwaysValid(func(g, e Value) bool { return MatchPattern(e.Str, g.Str) }), KindString, true
 	}
 	return nil, KindMissing, false
 }
