@@ -138,6 +138,13 @@ func flatten(v Value) []Value {
 //     CondEmptyValueSet and satisfies negated operators vacuously; both
 //     outcomes are stable and distinguishable from a missing key
 //     (CondKeyMissing) and from an ordinary mismatch (CondNoMatch).
+//   - ALL expected values are validated against the operator's domain, even
+//     when an earlier member already matches. A malformed member anywhere in
+//     the list (e.g. "10.0.0.0/33" beside a matching "10.0.0.0/8") therefore
+//     always yields CondInvalidValue, for both positive and negated
+//     operators, regardless of the members' order or of which member the
+//     actual value hits. The typo can never be hidden by another member that
+//     matches.
 func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason) {
 	name := string(op)
 	if strings.HasSuffix(name, ifExistsSuffix) {
@@ -179,6 +186,14 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 
 	// matches[i] reports whether actual value i satisfies the predicate
 	// against at least one expected value of the right kind.
+	//
+	// EVERY (actual, expected) pair is examined: validation must never stop
+	// after the first matching expected value. Otherwise a malformed member
+	// later in the expected list (e.g. "10.0.0.0/33" sitting behind a matching
+	// "10.0.0.0/8") would be skipped entirely, so the clause conclusion — and
+	// even whether the typo is reported — would depend on the order of the
+	// expected values. Scanning all pairs makes match/no-match, type errors
+	// and invalid-value failures independent of list order on either side.
 	matches := make([]bool, len(gotElems))
 	typeError := false
 	invalid := false
@@ -197,10 +212,9 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 				invalid = true
 				continue
 			}
-			if ok {
-				matches[i] = true
-				break
-			}
+			// No break on match: the remaining expected values are still
+			// examined so a malformed member anywhere in the list is detected.
+			matches[i] = matches[i] || ok
 		}
 	}
 
