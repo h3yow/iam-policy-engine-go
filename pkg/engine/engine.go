@@ -288,7 +288,7 @@ func finalize(d Decision, r ReasonCode, detail string, hits []RuleHit, conds []p
 	seenC := map[string]int{}
 	var uniqConds []policies.ConditionOutcome
 	for _, c := range conds {
-		k := string(c.Operator) + "|" + c.Key + "|" + string(c.Reason)
+		k := string(c.Operator) + "|" + c.Key + "|" + string(c.Reason) + "|" + c.Detail
 		if _, ok := seenC[k]; ok {
 			continue
 		}

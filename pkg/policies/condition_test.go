@@ -32,7 +32,7 @@ func TestEvaluateConditions(t *testing.T) {
 		{"IfExists ignores missing key", setOf("StringEqualsIfExists", "nope", StringV("x")), ctx, true, CondOK},
 		{"type mismatch", setOf("NumericEquals", "env", NumberV(1)), ctx, false, CondTypeMismatch},
 		{"numeric mismatch", setOf("NumericGreaterThan", "count", NumberV(9)), ctx, false, CondNoMatch},
-		{"unknown operator", setOf("IpAddress", "env", StringV("x")), ctx, false, CondUnknownOperator},
+		{"unknown operator", setOf("QuantumEquals", "env", StringV("x")), ctx, false, CondUnknownOperator},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

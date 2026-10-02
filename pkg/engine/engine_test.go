@@ -9,7 +9,7 @@ import (
 
 var fixedNow = time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 
-func mustPolicy(t *testing.T, src policies.Source, doc string) policies.Policy {
+func mustPolicy(t testing.TB, src policies.Source, doc string) policies.Policy {
 	t.Helper()
 	p, err := policies.ParsePolicy(src, []byte(doc))
 	if err != nil {
