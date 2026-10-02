@@ -138,6 +138,11 @@ func flatten(v Value) []Value {
 //     CondEmptyValueSet and satisfies negated operators vacuously; both
 //     outcomes are stable and distinguishable from a missing key
 //     (CondKeyMissing) and from an ordinary mismatch (CondNoMatch).
+//   - A malformed actual or expected value (e.g. an unparseable IP/CIDR)
+//     fails the clause with CondInvalidValue no matter where the bad entry
+//     sits in its list and no matter whether another entry matched: every
+//     pair is validated, so a typo can never be hidden by a neighbouring
+//     hit. This holds identically for positive and negated operators.
 func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason) {
 	name := string(op)
 	if strings.HasSuffix(name, ifExistsSuffix) {
@@ -179,6 +184,13 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 
 	// matches[i] reports whether actual value i satisfies the predicate
 	// against at least one expected value of the right kind.
+	//
+	// Every (actual, expected) pair of the right kind is examined — the loop
+	// deliberately does NOT stop at the first match. A malformed entry (e.g.
+	// a CIDR with an out-of-range prefix length) must be reported no matter
+	// where it sits in the list; exiting early would let a matching entry
+	// hide a typo that appears after it, making the outcome depend on the
+	// order of the expected values.
 	matches := make([]bool, len(gotElems))
 	typeError := false
 	invalid := false
@@ -199,7 +211,6 @@ func evalClause(op Operator, got Value, expected []Value) (bool, ConditionReason
 			}
 			if ok {
 				matches[i] = true
-				break
 			}
 		}
 	}
